@@ -27,12 +27,16 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use client::Client;
+use datastore::DataStore;
 use futures::future;
 use tokio::select;
 use util::Race;
 
 use self::{network::InProcessNetwork, node::Node};
 
+mod client;
+mod datastore;
 mod network;
 mod node;
 mod rpc;
@@ -63,6 +67,7 @@ pub async fn main(Args { norepl, thrash }: Args) -> Result<()> {
                 *node,
                 nodes.iter().copied(),
                 network.handle(node)?,
+                DataStore::new(),
                 thrash,
             ))
         })
@@ -74,7 +79,8 @@ pub async fn main(Args { norepl, thrash }: Args) -> Result<()> {
     if norepl {
         tokio::signal::ctrl_c().await?;
     } else {
-        start_repl(&nodes, network).await;
+        let client = Client::new(&nodes);
+        start_repl(&nodes, network, client).await;
     }
     Ok(())
 }
@@ -92,6 +98,11 @@ enum Command {
     Degrade(u32),
     Fix,
     Thrash(bool),
+
+    Get(String),
+    Set(String, String),
+    Delete(String),
+
     Quit,
 }
 
@@ -118,13 +129,24 @@ impl FromStr for Command {
             ["fix"] => Ok(Command::Fix),
             ["thrash", "on"] => Ok(Command::Thrash(true)),
             ["thrash", "off"] => Ok(Command::Thrash(false)),
+
+            ["get", key] => Ok(Command::Get((*key).to_owned())),
+            ["set", key, value] => {
+                Ok(Command::Set((*key).to_owned(), (*value).to_owned()))
+            }
+            ["delete", key] => Ok(Command::Delete((*key).to_owned())),
+
             ["quit" | "exit"] => Ok(Command::Quit),
             words => bail!("Invalid command: {words:?}"),
         }
     }
 }
 
-async fn start_repl(nodes: &[Arc<Node>], mut network: InProcessNetwork) {
+async fn start_repl(
+    nodes: &[Arc<Node>],
+    mut network: InProcessNetwork,
+    mut client: Client,
+) {
     let mut buf = String::new();
     loop {
         buf.clear();
@@ -205,6 +227,21 @@ async fn start_repl(nodes: &[Arc<Node>], mut network: InProcessNetwork) {
                     .race()
                     .await;
             }
+
+            Command::Get(key) => match client.get(key).await {
+                Some(Some(value)) => println!("Get: {value}"),
+                Some(None) => println!("No value for key"),
+                None => println!("Get command was not accepted"),
+            },
+            Command::Set(key, value) => match client.set(key, value).await {
+                Some(()) => println!("Set command was accepted"),
+                None => println!("Set command was not accepted"),
+            },
+            Command::Delete(key) => match client.delete(key).await {
+                Some(()) => println!("Delete command was accepted"),
+                None => println!("Delete command was not accepted"),
+            },
+
             Command::Quit => return,
         }
     }

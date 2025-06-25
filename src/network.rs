@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    mem,
     sync::Arc,
 };
 
@@ -210,6 +211,12 @@ async fn dispatch_mail(
 
             // Finally we have a random chance to drop the message
             if should_drop(drop_chance) {
+                // If we drop the response channel then the reciever end will
+                // immediatly return None when polled, if we leak it instead
+                // it'll block forever. Try both
+                if rand::random_ratio(1, 2) {
+                    mem::forget(request.resp);
+                }
                 continue;
             }
 

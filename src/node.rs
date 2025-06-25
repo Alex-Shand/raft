@@ -1,9 +1,18 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use macros::spawn;
-use tokio::time::Instant;
+use tokio::{
+    signal,
+    sync::oneshot::{Receiver, Sender},
+    time::Instant,
+};
 
 use crate::{
+    datastore::DataStore,
     network::NetworkHandle,
     rpc::{self, RpcClient, RpcServer},
     util::{Locked, Race as _},
@@ -17,22 +26,55 @@ enum Role {
     Dead,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum Leadership {
+    Me,
+    Leader(String),
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+enum LogCommand {
+    Null,
+    Get(String),
+    Set(String, String),
+    Delete(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LogEntry {
+    command: LogCommand,
+    term: usize,
+}
+
 pub(crate) struct Node {
     pub(crate) name: String,
     peers: HashSet<String>,
     rpc: RpcClient,
+    logs_ready: tokio::sync::mpsc::Sender<()>,
     role: Locked<Role>,
     term: Locked<usize>,
     last_heartbeat: Locked<Instant>,
     last_vote: Locked<Option<String>>,
+    current_leader: Locked<Option<String>>,
     thrash: Locked<bool>,
+    store: Locked<DataStore>,
+    log: Locked<Vec<LogEntry>>,
+    next_index: Locked<HashMap<String, usize>>,
+    match_index: Locked<HashMap<String, usize>>,
+    commit_index: Locked<usize>,
+    last_applied: Locked<usize>,
+    subscriptions1: Locked<HashMap<usize, Sender<Option<String>>>>,
+    subscriptions2: Locked<HashMap<usize, Sender<()>>>,
 }
 
 #[derive(Debug)]
 #[expect(dead_code)]
 pub(crate) struct NodeStatus {
     role: Role,
+    leader: Leadership,
     term: usize,
+    store: DataStore,
 }
 
 impl Node {
@@ -40,29 +82,102 @@ impl Node {
         name: impl Into<String>,
         peers: impl Iterator<Item = impl Into<String>>,
         network: NetworkHandle,
+        store: DataStore,
         thrash: bool,
     ) -> Arc<Self> {
         let name = name.into();
         let mut peers = peers.map(Into::into).collect::<HashSet<_>>();
         let _ = peers.remove(&name);
+        let (sender, reciever) = tokio::sync::mpsc::channel(1);
         let this = Arc::new(Self {
             name,
             peers,
+            logs_ready: sender,
             rpc: RpcClient::new(network.clone()),
             role: Locked::new(Role::Dead),
             term: Locked::new(0),
             last_heartbeat: Locked::new(Instant::now()),
             last_vote: Locked::new(None),
+            current_leader: Locked::new(None),
             thrash: Locked::new(thrash),
+            store: Locked::new(store),
+            log: Locked::new(vec![LogEntry {
+                command: LogCommand::Null,
+                term: 0,
+            }]),
+            next_index: Locked::new(HashMap::new()),
+            match_index: Locked::new(HashMap::new()),
+            commit_index: Locked::new(0),
+            last_applied: Locked::new(0),
+            subscriptions1: Locked::new(HashMap::new()),
+            subscriptions2: Locked::new(HashMap::new()),
         });
         rpc::start_rpc(network, this.clone()).await;
+        this.clone().start_submitter(reciever).await;
         this
+    }
+
+    #[spawn]
+    async fn start_submitter(
+        self: Arc<Self>,
+        signal: tokio::sync::mpsc::Receiver<()>,
+    ) -> ! {
+        let mut signal = signal;
+        loop {
+            let Some(()) = signal.recv().await else {
+                continue;
+            };
+            let commit_index = self.commit_index.get().await;
+            let mut last_applied = self.last_applied.write().await;
+            let entries = if commit_index > *last_applied {
+                let entries = self.log.read().await
+                    [*last_applied + 1..=commit_index]
+                    .to_vec();
+                *last_applied = commit_index;
+                entries
+            } else {
+                Vec::new()
+            };
+            drop(last_applied);
+            for (id, entry) in entries.into_iter().enumerate() {
+                let id = commit_index + id;
+                match entry.command {
+                    LogCommand::Null => (),
+                    LogCommand::Get(key) => {
+                        let result = self.store.read().await.get(&key);
+                        if let Some(sender) =
+                            self.subscriptions1.write().await.remove(&id)
+                        {
+                            let _ = sender.send(result);
+                        }
+                    }
+                    LogCommand::Set(key, value) => {
+                        self.store.write().await.set(key, value);
+                        if let Some(sender) =
+                            self.subscriptions2.write().await.remove(&id)
+                        {
+                            let _ = sender.send(());
+                        }
+                    }
+                    LogCommand::Delete(key) => {
+                        self.store.write().await.delete(&key);
+                        if let Some(sender) =
+                            self.subscriptions2.write().await.remove(&id)
+                        {
+                            let _ = sender.send(());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) async fn status(&self) -> NodeStatus {
         NodeStatus {
             role: self.role.get().await,
+            leader: self.get_leader().await,
             term: self.term.get().await,
+            store: self.store.read().await.clone(),
         }
     }
 
@@ -78,10 +193,63 @@ impl Node {
         self.thrash.set(thrash).await;
     }
 
+    pub(crate) async fn get_leader(&self) -> Leadership {
+        match self.role.get().await {
+            Role::Leader => Leadership::Me,
+            Role::Candidate | Role::Dead => Leadership::Unknown,
+            Role::Follower => self
+                .current_leader
+                .read()
+                .await
+                .as_ref()
+                .cloned()
+                .map_or(Leadership::Unknown, Leadership::Leader),
+        }
+    }
+
+    pub(crate) async fn get(
+        &self,
+        key: String,
+    ) -> Option<Receiver<Option<String>>> {
+        let (sender, reciever) = tokio::sync::oneshot::channel();
+        let id = self.push_log(LogCommand::Get(key)).await?;
+        let _ = self.subscriptions1.write().await.insert(id, sender);
+        Some(reciever)
+    }
+
+    pub(crate) async fn set(
+        &self,
+        key: String,
+        value: String,
+    ) -> Option<Receiver<()>> {
+        let (sender, reciever) = tokio::sync::oneshot::channel();
+        let id = self.push_log(LogCommand::Set(key, value)).await?;
+        let _ = self.subscriptions2.write().await.insert(id, sender);
+        Some(reciever)
+    }
+
+    pub(crate) async fn delete(&self, key: String) -> Option<Receiver<()>> {
+        let (sender, reciever) = tokio::sync::oneshot::channel();
+        let id = self.push_log(LogCommand::Delete(key)).await?;
+        let _ = self.subscriptions2.write().await.insert(id, sender);
+        Some(reciever)
+    }
+
+    async fn push_log(&self, command: LogCommand) -> Option<usize> {
+        if let Role::Leader = self.role.get().await {
+            let term = self.term.get().await;
+            let mut log = self.log.write().await;
+            log.push(LogEntry { command, term });
+            return Some(log.len() - 1);
+        }
+        None
+    }
+
     async fn start_follower(self: Arc<Self>, term: usize) {
         self.role.set(Role::Follower).await;
         self.term.set(term).await;
         self.last_vote.set(None).await;
+        self.current_leader.set(None).await;
         self.election_timer().await;
     }
 
@@ -122,6 +290,9 @@ impl Node {
         self.role.set(Role::Candidate).await;
         let election_term = self.term.incr().await;
         self.last_vote.set(Some(self.name.clone())).await;
+        self.current_leader.set(None).await;
+        let (last_log_index, last_log_term) =
+            self.get_last_log_index_and_term().await;
 
         // Start with one vote because the node voted for itself
         let total_votes = Arc::new(Locked::new(1));
@@ -138,6 +309,8 @@ impl Node {
                 self.clone().request_vote_from(
                     peer.to_owned(),
                     election_term,
+                    last_log_index,
+                    last_log_term,
                     total_votes.clone(),
                 )
             })
@@ -145,10 +318,18 @@ impl Node {
             .await;
     }
 
+    async fn get_last_log_index_and_term(&self) -> (usize, usize) {
+        let log = self.log.read().await;
+        let last_log_index = log.len() - 1;
+        (last_log_index, log[last_log_index].term)
+    }
+
     async fn request_vote_from(
         self: Arc<Self>,
         peer: String,
         election_term: usize,
+        last_log_index: usize,
+        last_log_term: usize,
         total_votes: Arc<Locked<usize>>,
     ) {
         // Ask for a vote, this could block forever or return nothing at the
@@ -156,7 +337,12 @@ impl Node {
         let Some((response_term, vote_granted)) = self
             .rpc
             .to(&peer)
-            .request_vote(&self.name, election_term)
+            .request_vote(
+                &self.name,
+                election_term,
+                last_log_index,
+                last_log_term,
+            )
             .await
         else {
             // Bail if we know there is no response coming
@@ -188,6 +374,15 @@ impl Node {
 
     async fn start_leader(self: Arc<Self>) {
         self.role.set(Role::Leader).await;
+        let ni = self.log.read().await.len();
+        {
+            let mut next_index = self.next_index.write().await;
+            let mut match_index = self.match_index.write().await;
+            for peer in &self.peers {
+                let _ = next_index.insert(peer.to_owned(), ni);
+                let _ = match_index.insert(peer.to_owned(), 0);
+            }
+        }
         // The leader sends out heartbeats immedatly upon assuming leadership,
         // then again every 50ms.
         loop {
@@ -225,9 +420,25 @@ impl Node {
         peer: String,
         current_term: usize,
     ) {
+        let log = self.log.read().await;
+        let ni = self.next_index.read().await[&peer];
+        let prev_index = ni - 1;
+        let prev_term = log[prev_index].term;
+        let entries = &log[ni..];
+
         // Same as request_vote rpc
-        let Some(response_term) =
-            self.rpc.to(&peer).append_logs(current_term).await
+        let Some((response_term, success)) = self
+            .rpc
+            .to(&peer)
+            .append_logs(
+                current_term,
+                &self.name,
+                prev_index,
+                prev_term,
+                entries,
+                self.commit_index.get().await,
+            )
+            .await
         else {
             return;
         };
@@ -235,15 +446,76 @@ impl Node {
         // The heartbeat response contains a higher term, we've fallen behind,
         // become a follower
         if response_term > current_term {
-            self.start_follower(response_term).await;
+            self.clone().start_follower(response_term).await;
+        }
+
+        if matches!(self.role.get().await, Role::Leader)
+            && current_term == response_term
+        {
+            if success {
+                let _ = self
+                    .next_index
+                    .write()
+                    .await
+                    .insert(peer.clone(), ni + entries.len());
+                let _ = self
+                    .match_index
+                    .write()
+                    .await
+                    .insert(peer.clone(), ni + entries.len() - 1);
+                self.check_for_committed_entries(
+                    current_term,
+                    &self.peers,
+                    &log,
+                )
+                .await;
+            } else {
+                let _ =
+                    self.next_index.write().await.insert(peer.clone(), ni - 1);
+            }
         }
     }
 
-    async fn can_vote_for(&self, node: &str) -> bool {
+    async fn check_for_committed_entries(
+        &self,
+        current_term: usize,
+        peers: &HashSet<String>,
+        log: &[LogEntry],
+    ) {
+        let commit_index = self.commit_index.get().await;
+        for (index, entry) in log.iter().enumerate().skip(commit_index + 1) {
+            if entry.term == current_term {
+                let mut match_count = 1;
+                for peer in peers {
+                    if self.match_index.read().await[peer] >= index {
+                        match_count += 1;
+                    }
+                }
+                if match_count * 2 > peers.len() + 1 {
+                    self.commit_index.set(index).await;
+                }
+            }
+        }
+        if self.commit_index.get().await != commit_index {
+            let _ = self.logs_ready.try_send(());
+        }
+    }
+
+    async fn can_vote_for(
+        &self,
+        node: &str,
+        requestor_last_log_index: usize,
+        requestor_last_log_term: usize,
+    ) -> bool {
+        let (last_log_index, last_log_term) =
+            self.get_last_log_index_and_term().await;
+        let last_log_compatible = requestor_last_log_term > last_log_term
+            || (requestor_last_log_term == last_log_term
+                && requestor_last_log_index >= last_log_index);
         let Some(vote) = &*self.last_vote.read().await else {
-            return true;
+            return last_log_compatible;
         };
-        vote == node
+        vote == node && last_log_compatible
     }
 
     async fn common_rpc_checks(self: Arc<Self>, term: usize) -> Option<()> {
@@ -275,15 +547,21 @@ impl Node {
 impl RpcServer for Arc<Node> {
     async fn request_vote(
         &self,
-        node: &str,
+        node: String,
         term: usize,
+        last_log_index: usize,
+        last_log_term: usize,
     ) -> Option<(usize, bool)> {
         self.clone().common_rpc_checks(term).await?;
 
         // If we can vote for the requesting node, record our vote, reset the
         // election timeout and tell the node
-        if self.term.get().await == term && self.can_vote_for(node).await {
-            self.last_vote.set(Some(node.to_owned())).await;
+        if self.term.get().await == term
+            && self
+                .can_vote_for(&node, last_log_index, last_log_term)
+                .await
+        {
+            self.last_vote.set(Some(node)).await;
             self.last_heartbeat.set(Instant::now()).await;
             return Some((term, true));
         }
@@ -292,13 +570,23 @@ impl RpcServer for Arc<Node> {
         Some((term, false))
     }
 
-    async fn append_logs(&self, term: usize) -> Option<usize> {
+    async fn append_logs(
+        &self,
+        term: usize,
+        leader: String,
+        prev_index: usize,
+        prev_term: usize,
+        entries: Vec<LogEntry>,
+        leader_commit: usize,
+    ) -> Option<(usize, bool)> {
         self.clone().common_rpc_checks(term).await?;
 
         // If the term matches we can accept the heartbeat
         if self.term.get().await == term {
             match self.role.get().await {
-                Role::Follower => (),
+                Role::Follower => {
+                    self.current_leader.set(Some(leader)).await;
+                }
                 // If we've somehow died while trying to get the term lock, bail
                 Role::Dead => return None,
                 // If we're recieving heartbeats, clearly somebody else thinks
@@ -307,10 +595,42 @@ impl RpcServer for Arc<Node> {
             }
             // Reset the election timer
             self.last_heartbeat.set(Instant::now()).await;
-            // This will probably get more complicated when we do logs...
-            return Some(term);
+
+            let mut log = self.log.write().await;
+            if prev_index < log.len() && prev_term == log[prev_index].term {
+                let mut insert_index = prev_index + 1;
+                let mut new_entries_index = 0;
+                loop {
+                    if insert_index >= log.len()
+                        || new_entries_index != entries.len()
+                    {
+                        break;
+                    }
+                    if log[insert_index].term != entries[new_entries_index].term
+                    {
+                        break;
+                    }
+                    insert_index += 1;
+                    new_entries_index += 1;
+                }
+
+                if new_entries_index < entries.len() {
+                    drop(log.drain(insert_index..));
+                    log.extend(entries[new_entries_index..].iter().cloned());
+                }
+
+                let commit_index = self.commit_index.get().await;
+                if leader_commit > commit_index {
+                    self.commit_index
+                        .set(usize::min(leader_commit, log.len()))
+                        .await;
+                    let _ = self.logs_ready.try_send(());
+                }
+
+                return Some((term, true));
+            }
         }
 
-        Some(term)
+        Some((term, false))
     }
 }
