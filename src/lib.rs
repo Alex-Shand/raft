@@ -40,6 +40,8 @@ mod datastore;
 mod network;
 mod node;
 mod rpc;
+#[cfg(test)]
+mod tests;
 mod util;
 
 /// raft
@@ -72,7 +74,7 @@ pub async fn main(Args { norepl, thrash }: Args) -> Result<()> {
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let nodes = future::join_all(nodes.into_iter()).await;
+    let nodes = future::join_all(nodes).await;
     for node in &nodes {
         node.clone().start().await;
     }

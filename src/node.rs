@@ -6,7 +6,6 @@ use std::{
 
 use macros::spawn;
 use tokio::{
-    signal,
     sync::oneshot::{Receiver, Sender},
     time::Instant,
 };
@@ -205,6 +204,11 @@ impl Node {
                 .cloned()
                 .map_or(Leadership::Unknown, Leadership::Leader),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get_term(&self) -> usize {
+        self.term.get().await
     }
 
     pub(crate) async fn get(
